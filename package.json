@@ -9,16 +9,16 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/AnanyaSudarshan/GrowthMindz-server.git"
+    "url": "git+https://github.com/AnanyaSudarshan/MindsetMovez-server.git"
   },
   "keywords": [],
   "author": "",
   "license": "ISC",
   "type": "commonjs",
   "bugs": {
-    "url": "https://github.com/AnanyaSudarshan/GrowthMindz-server/issues"
+    "url": "https://github.com/AnanyaSudarshan/MindsetMovez-server/issues"
   },
-  "homepage": "https://github.com/AnanyaSudarshan/GrowthMindz-server#readme",
+  "homepage": "https://github.com/AnanyaSudarshan/MindsetMovez-server#readme",
   "dependencies": {
     "body-parser": "^2.2.0",
     "cors": "^2.8.5",
