@@ -108,6 +108,24 @@ app.get("/api/get-all-users", async(req, res) => {
   }
 });
 
+// --- GET COURSES WITH VIDEO AND CATEGORY FILTER ---
+app.get('/api/courses', async (req, res) => {
+  try {
+    const { category } = req.query;
+    let query = 'SELECT * FROM courses';
+    const params = [];
+    if (category) {
+      query += ' WHERE category = $1';
+      params.push(category);
+    }
+    const result = await pool.query(query, params);
+    res.json(result.rows);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
 app.listen(5000, () => console.log("✅ Backend running on port 5000"));
 
 
