@@ -126,6 +126,26 @@ app.get('/api/courses', async (req, res) => {
   }
 });
 
+// --- GET COURSE VIDEOS JOINED WITH COURSES ---
+app.get('/api/course-videos', async (req, res) => {
+  try {
+    // Select from courses_vedio directly; it already stores course_title
+    const sql = `
+      SELECT 
+        v.course_title AS course_title,
+        v.course_vedio_title AS course_vedio_title,
+        v.vedio_url AS vedio_url
+      FROM courses_vedio v
+      ORDER BY v.cid, v.id
+    `;
+    const result = await pool.query(sql);
+    res.json(result.rows);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Database error' });
+  }
+});
+
 // --- QUIZ TABLES AND SUBMISSION ENDPOINT ---
 (async () => {
   try {
