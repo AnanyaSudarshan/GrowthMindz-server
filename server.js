@@ -151,22 +151,29 @@ app.get('/api/course-videos', async (req, res) => {
   try {
     await pool.query(`
       CREATE TABLE IF NOT EXISTS quiz_submissions (
-        id SERIAL PRIMARY KEY,
+        submission_id SERIAL PRIMARY KEY,
         user_id INTEGER,
-        quiz_id TEXT NOT NULL,
+        qid INTEGER NOT NULL,
         score INTEGER NOT NULL,
-        total INTEGER NOT NULL,
-        created_at TIMESTAMP DEFAULT NOW()
+        submitted_at TIMESTAMP DEFAULT NOW()
       );
     `);
     await pool.query(`
       CREATE TABLE IF NOT EXISTS quiz_answers (
-        id SERIAL PRIMARY KEY,
-        submission_id INTEGER NOT NULL REFERENCES quiz_submissions(id) ON DELETE CASCADE,
-        question_id TEXT NOT NULL,
-        selected_option INTEGER NOT NULL,
+        answer_id SERIAL PRIMARY KEY,
+        submission_id INTEGER NOT NULL REFERENCES quiz_submissions(submission_id) ON DELETE CASCADE,
+        question_id INTEGER NOT NULL,
+        selected_answers CHAR(1) NOT NULL,
         is_correct BOOLEAN NOT NULL
       );
+    `);
+    // Ensure quizes has rows for all qids found in quiz_content (to satisfy FK on quiz_submissions.qid)
+    await pool.query(`
+      INSERT INTO quizes (qid, quiz_title)
+      SELECT DISTINCT qc.qid, ('Chapter-' || qc.qid || ' quiz')
+      FROM quiz_content qc
+      LEFT JOIN quizes qz ON qz.qid = qc.qid
+      WHERE qz.qid IS NULL;
     `);
     console.log('✅ Quiz tables ensured');
   } catch (e) {
@@ -177,86 +184,107 @@ app.get('/api/course-videos', async (req, res) => {
 // --- GET QUIZ QUESTIONS ENDPOINT ---
 app.get('/api/quiz/questions', async (req, res) => {
   try {
-    // Find the NISM quiz (quiz_id = 3, which corresponds to "Chapter-1 quiz")
-    const quizResult = await pool.query(
-      `SELECT qq.id, qq.quiz_id, qq.question_text, qq.question_order,
-              q.title as quiz_title
-       FROM quiz_questions qq
-       JOIN quizzes q ON qq.quiz_id = q.id
-       WHERE q.title = 'Chapter-1 quiz' OR q.title LIKE '%Chapter%'
-       ORDER BY qq.question_order;`
+    const { qid } = req.query;
+    const qidNum = Number.isFinite(parseInt(qid, 10)) ? parseInt(qid, 10) : 2; // default to 2
+
+    const rowsRes = await pool.query(
+      `SELECT qc.question_id,
+              qc.qid,
+              qc.question,
+              qc.option_a,
+              qc.option_b,
+              qc.option_c,
+              qc.option_d,
+              qc.correct_answer,
+              qz.quiz_title
+       FROM quiz_content qc
+       LEFT JOIN quizes qz ON qz.qid = qc.qid
+       WHERE qc.qid = $1
+       ORDER BY qc.question_id;`,
+      [qidNum]
     );
 
-    if (quizResult.rows.length === 0) {
-      return res.status(404).json({ message: 'Quiz not found' });
+    let rows = rowsRes.rows;
+    if (rows.length === 0) {
+      // Fallback: find the smallest available qid in quiz_content and load its questions
+      const anyQidRes = await pool.query(
+        `SELECT MIN(qid) AS qid FROM quiz_content;`
+      );
+      const fallbackQid = anyQidRes.rows[0]?.qid;
+      if (!fallbackQid) {
+        return res.status(404).json({ message: 'Quiz not found' });
+      }
+      const fallbackRowsRes = await pool.query(
+        `SELECT qc.question_id,
+                qc.qid,
+                qc.question,
+                qc.option_a,
+                qc.option_b,
+                qc.option_c,
+                qc.option_d,
+                qc.correct_answer,
+                qz.quiz_title
+         FROM quiz_content qc
+         LEFT JOIN quizes qz ON qz.qid = qc.qid
+         WHERE qc.qid = $1
+         ORDER BY qc.question_id;`,
+        [fallbackQid]
+      );
+      rows = fallbackRowsRes.rows;
     }
 
-    // Get all options for these questions
-    const questionIds = quizResult.rows.map(q => q.id);
-    const optionsResult = await pool.query(
-      `SELECT question_id, option_text, is_correct, option_order
-       FROM quiz_options
-       WHERE question_id = ANY($1::int[])
-       ORDER BY question_id, option_order;`,
-      [questionIds]
-    );
-
-    // Get mapping between quiz_questions.id and quiz_content.question_id
-    const questionMappingResult = await pool.query(
-      `SELECT qq.id as quiz_questions_id, qc.question_id as quiz_content_id, qq.question_text
-       FROM quiz_questions qq
-       LEFT JOIN quiz_content qc ON qq.question_text = qc.question
-       WHERE qq.id = ANY($1::int[]);`,
-      [questionIds]
-    );
-
-    // Create mapping object
-    const questionIdMap = {};
-    questionMappingResult.rows.forEach(row => {
-      questionIdMap[row.quiz_questions_id] = row.quiz_content_id;
-    });
-
-    // Build the questions array in the format expected by the frontend
-    const questionsMap = {};
-    quizResult.rows.forEach(q => {
-      questionsMap[q.id] = {
-        id: q.id,
-        questionId: questionIdMap[q.id] || q.id, // Store quiz_content.question_id for submission
-        question: q.question_text,
-        options: [],
-        answer: null,
-        quiz_title: q.quiz_title
+    const mapLetterToIndex = { A: 0, B: 1, C: 2, D: 3 };
+    const questions = rows.map(r => {
+      const options = [r.option_a, r.option_b, r.option_c, r.option_d].filter(Boolean);
+      const letter = String(r.correct_answer || '').trim().toUpperCase();
+      const idx = mapLetterToIndex[letter] ?? 0;
+      const answer = options[idx] || '';
+      return {
+        id: r.question_id,
+        questionId: r.question_id,
+        question: r.question,
+        options,
+        answer,
+        quiz_title: r.quiz_title || null
       };
-    });
-
-    // Add options to each question
-    optionsResult.rows.forEach(opt => {
-      if (questionsMap[opt.question_id]) {
-        questionsMap[opt.question_id].options.push(opt.option_text);
-        if (opt.is_correct) {
-          questionsMap[opt.question_id].answer = opt.option_text;
-        }
-      }
-    });
-
-    // Convert to array and ensure answer is set
-    const questions = Object.values(questionsMap).map(q => {
-      // If answer is not set, use the first correct option text
-      if (!q.answer && q.options.length > 0) {
-        const correctOption = optionsResult.rows.find(
-          opt => opt.question_id === q.id && opt.is_correct
-        );
-        if (correctOption) {
-          q.answer = correctOption.option_text;
-        }
-      }
-      return q;
     });
 
     res.json(questions);
   } catch (e) {
     console.error('Error fetching quiz questions:', e);
     res.status(500).json({ message: 'Internal server error', error: e.message });
+  }
+});
+
+app.get('/api/quiz-content', async (req, res) => {
+  try {
+    const { qid } = req.query;
+    const qidNum = parseInt(qid, 10);
+    if (!Number.isInteger(qidNum)) {
+      return res.status(400).json({ message: 'qid query param is required and must be an integer' });
+    }
+
+    const questionsResult = await pool.query(
+      `SELECT question_id, qid, question, option_a, option_b, option_c, option_d, correct_answer
+       FROM quiz_content
+       WHERE qid = $1
+       ORDER BY question_id;`,
+      [qidNum]
+    );
+
+    const titleResult = await pool.query(
+      'SELECT quiz_title FROM quizes WHERE qid = $1 LIMIT 1;',
+      [qidNum]
+    );
+
+    res.json({
+      qid: qidNum,
+      quiz_title: (titleResult.rows[0] && titleResult.rows[0].quiz_title) || null,
+      questions: questionsResult.rows
+    });
+  } catch (e) {
+    console.error('Error fetching quiz_content by qid:', e);
+    res.status(500).json({ message: 'Internal server error' });
   }
 });
 // API endpoint to save quiz answers
@@ -385,8 +413,27 @@ app.post('/api/quiz/submit', async (req, res) => {
     const totalQuestions = questions.length;
     const score = correctCount;
     
-    // Get qid for NISM quiz (qid = 2 based on migration)
-    const quizQid = 2; // NISM Chapter-1 quiz
+    // Determine a valid qid to satisfy FK to quizes
+    const requestedQid = Number.isFinite(parseInt(req.body?.qid, 10)) ? parseInt(req.body.qid, 10) : 2;
+    let quizQid = requestedQid;
+    // Check if requestedQid exists in quizes
+    const qidCheck = await client.query('SELECT qid FROM quizes WHERE qid = $1', [requestedQid]);
+    if (qidCheck.rows.length === 0) {
+      // Fallback to first available qid in quizes
+      const anyQid = await client.query('SELECT qid FROM quizes ORDER BY qid LIMIT 1');
+      if (anyQid.rows.length > 0) {
+        quizQid = anyQid.rows[0].qid;
+      } else {
+        // As a last resort, create a stub quiz row to satisfy FK
+        try {
+          await client.query('INSERT INTO quizes (qid, quiz_title) VALUES ($1, $2)', [requestedQid, 'Chapter-1 quiz']);
+          quizQid = requestedQid;
+        } catch (stubErr) {
+          console.error('Failed to create stub quiz in quizes:', stubErr.message);
+          throw stubErr;
+        }
+      }
+    }
     
     // Insert into quiz_submissions
     const submissionResult = await client.query(
