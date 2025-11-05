@@ -21,6 +21,34 @@ app.post("/api/signup", async (req, res) => {
   }
 });
 
+// --- ENROLLMENT ENDPOINT ---
+app.post('/api/enroll', async (req, res) => {
+  try {
+    const { uid, courses_opted, cid } = req.body || {};
+    const userId = parseInt(uid, 10) || null;
+    const courseId = parseInt(cid, 10) || null;
+    const courseKey = (courses_opted || '').toString();
+
+    if (!userId || !courseKey || !courseId) {
+      return res.status(400).json({ ok: false, message: 'uid, courses_opted, and cid are required' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO enrollments (uid, courses_opted, cid, progress, enrolled_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       ON CONFLICT (uid, cid, courses_opted)
+       DO UPDATE SET enrolled_at = EXCLUDED.enrolled_at
+       RETURNING *;`,
+      [userId, courseKey, courseId, 0]
+    );
+
+    res.json({ ok: true, enrollment: result.rows[0] });
+  } catch (e) {
+    console.error('Enroll API error:', e);
+    res.status(500).json({ ok: false, message: 'Internal server error' });
+  }
+});
+
 // Example login route
 app.post("/api/login", async (req, res) => {
   try {
@@ -163,10 +191,22 @@ app.get('/api/course-videos', async (req, res) => {
         answer_id SERIAL PRIMARY KEY,
         submission_id INTEGER NOT NULL REFERENCES quiz_submissions(submission_id) ON DELETE CASCADE,
         question_id INTEGER NOT NULL,
-        selected_answers CHAR(1) NOT NULL,
+        selected_answer CHAR(1) NOT NULL,
         is_correct BOOLEAN NOT NULL
       );
     `);
+    // Backward compatibility: if old column 'selected_answers' exists, rename it
+    try {
+      const colCheck = await pool.query(`
+        SELECT column_name FROM information_schema.columns
+        WHERE table_name = 'quiz_answers' AND column_name = 'selected_answers';
+      `);
+      if (colCheck.rows.length > 0) {
+        await pool.query('ALTER TABLE quiz_answers RENAME COLUMN selected_answers TO selected_answer;');
+      }
+    } catch (renameErr) {
+      console.warn('Column rename check failed (safe to ignore if not needed):', renameErr.message);
+    }
     // Ensure quizes has rows for all qids found in quiz_content (to satisfy FK on quiz_submissions.qid)
     await pool.query(`
       INSERT INTO quizes (qid, quiz_title)
@@ -176,6 +216,36 @@ app.get('/api/course-videos', async (req, res) => {
       WHERE qz.qid IS NULL;
     `);
     console.log('✅ Quiz tables ensured');
+
+    // Ensure enrollments table exists matching provided schema
+    await pool.query(`
+      CREATE TABLE IF NOT EXISTS enrollments (
+        eid SERIAL PRIMARY KEY,
+        uid INTEGER,
+        courses_opted VARCHAR,
+        cid INTEGER,
+        progress REAL,
+        enrolled_at TIMESTAMPTZ DEFAULT NOW()
+      );
+    `);
+    // Add a unique constraint to avoid duplicate enrollments for same user/course
+    try {
+      await pool.query(`
+        DO $$
+        BEGIN
+          IF NOT EXISTS (
+            SELECT 1 FROM pg_constraint
+            WHERE conname = 'uq_enrollments_user_course'
+          ) THEN
+            ALTER TABLE enrollments
+            ADD CONSTRAINT uq_enrollments_user_course UNIQUE (uid, cid, courses_opted);
+          END IF;
+        END$$;
+      `);
+    } catch (e) {
+      console.warn('Unique constraint for enrollments may already exist:', e.message);
+    }
+    console.log('✅ Enrollments table ensured');
   } catch (e) {
     console.error('Failed ensuring quiz tables', e);
   }
@@ -290,13 +360,17 @@ app.get('/api/quiz-content', async (req, res) => {
 // API endpoint to save quiz answers
 app.post('/api/quiz-answers', async (req, res) => {
   try {
-    let { submission_id, question_id, selected_answers, is_correct } = req.body || {};
+    // Accept either selected_answer or selected_answers from client
+    let { submission_id, question_id, selected_answer, selected_answers, is_correct } = req.body || {};
 
     // Basic validation and normalization
     const submissionIdNum = parseInt(submission_id, 10);
     const questionIdNum = parseInt(question_id, 10);
-    const sel = (typeof selected_answers === 'string' && selected_answers.length > 0)
-      ? selected_answers.trim().toUpperCase()[0]
+    const incomingSel = (typeof selected_answer === 'string' && selected_answer.length > 0)
+      ? selected_answer
+      : selected_answers;
+    const sel = (typeof incomingSel === 'string' && incomingSel.length > 0)
+      ? incomingSel.trim().toUpperCase()[0]
       : 'N'; // Single char required by DB (A/B/C/D or N for not answered)
     const isCorrectBool = Boolean(is_correct);
 
@@ -309,7 +383,7 @@ app.post('/api/quiz-answers', async (req, res) => {
     const selectedChar = validChars.has(sel) ? sel : 'N';
 
     const result = await pool.query(
-      `INSERT INTO quiz_answers (submission_id, question_id, selected_answers, is_correct)
+      `INSERT INTO quiz_answers (submission_id, question_id, selected_answer, is_correct)
        VALUES ($1, $2, $3, $4) RETURNING *`,
       [submissionIdNum, questionIdNum, selectedChar, isCorrectBool]
     );
@@ -343,7 +417,7 @@ app.get('/api/quiz/submissions/latest', async (req, res) => {
       `SELECT qa.answer_id,
               qa.submission_id,
               qa.question_id,
-              qa.selected_answers,
+              qa.selected_answer,
               qa.is_correct,
               qc.question
        FROM quiz_answers qa
@@ -450,7 +524,7 @@ app.post('/api/quiz/submit', async (req, res) => {
     for (const answer of answerDetails) {
       try {
         await client.query(
-          `INSERT INTO quiz_answers (submission_id, question_id, selected_answers, is_correct) 
+          `INSERT INTO quiz_answers (submission_id, question_id, selected_answer, is_correct) 
            VALUES ($1, $2, $3, $4);`,
           [submissionId, answer.questionId, answer.selectedAnswer, answer.isCorrect]
         );
@@ -518,7 +592,7 @@ app.post('/api/quizzes/nism/ch1/submit', async (req, res) => {
     if (answers.length > 0) {
       for (const a of answers) {
         await pool.query(
-          `INSERT INTO quiz_answers (submission_id, question_id, selected_answers, is_correct) 
+          `INSERT INTO quiz_answers (submission_id, question_id, selected_answer, is_correct) 
            VALUES ($1, $2, $3, $4);`,
           [submissionId, a.questionId, String(a.selectedOption || ''), Boolean(a.isCorrect)]
         );
